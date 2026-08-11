@@ -399,9 +399,12 @@ async function syncAndIndex() {
     }
 
     await ensureModels();
+    const MAX_ATTEMPTS = 3;
     let done = 0;
+    let failedCount = 0;
     for (const p of photos) {
       setIndexBanner(`Matching faces… ${done}/${photos.length}`, true);
+      let succeeded = false;
       try {
         let thumbRec = await idbGet("thumbs", p.path);
         if (!thumbRec) {
@@ -424,10 +427,28 @@ async function syncAndIndex() {
             await idbPut("faces", { path: p.path, personId });
           }
         }
+        succeeded = true;
       } catch (err) {
         console.warn("Indexing failed for", p.path, err);
       }
-      p.indexed = true;
+
+      // Only mark a photo "indexed" (done, won't be retried) once it has
+      // actually been processed successfully. A photo that fails (e.g. a
+      // network blip mid-download, or the app closing mid-index) is left
+      // for the next sync to pick up again automatically — up to
+      // MAX_ATTEMPTS times, after which it's marked as a permanent skip
+      // so a single corrupt file can't stall every future sync forever.
+      if (succeeded) {
+        p.indexed = true;
+        p.failCount = 0;
+      } else {
+        p.failCount = (p.failCount || 0) + 1;
+        if (p.failCount >= MAX_ATTEMPTS) {
+          p.indexed = true;
+          p.indexFailed = true;
+        }
+        failedCount++;
+      }
       await idbPut("photos", p);
       done++;
       if (done % 5 === 0) {
@@ -437,7 +458,11 @@ async function syncAndIndex() {
     }
     renderGrid();
     renderPeople();
-    setIndexBanner("", false);
+    setIndexBanner(
+      failedCount > 0 ? `Done — ${failedCount} photo${failedCount === 1 ? "" : "s"} will retry next sync` : "",
+      failedCount > 0
+    );
+    if (failedCount > 0) setTimeout(() => setIndexBanner("", false), 5000);
   } catch (err) {
     console.error(err);
     setIndexBanner("Sync paused — " + err.message, true);
@@ -456,9 +481,47 @@ function blobToImage(blob) {
   });
 }
 
+/* ---------------- Maintenance ---------------- */
+async function clearStore(name) {
+  const db = await dbp;
+  return new Promise((res, rej) => {
+    const tx = db.transaction(name, "readwrite");
+    tx.objectStore(name).clear();
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
+async function rebuildFaceIndex() {
+  await clearStore("faces");
+  await clearStore("people");
+  const photos = await idbAll("photos");
+  for (const p of photos) {
+    p.indexed = false;
+    p.hasFace = false;
+    p.failCount = 0;
+    delete p.indexFailed;
+    await idbPut("photos", p);
+  }
+  state.activeFilterPerson = null;
+  $("#filterBar").classList.remove("active");
+  await renderGrid();
+  await renderPeople();
+  syncAndIndex();
+}
+
 /* ---------------- Wire up events ---------------- */
 $("#connectBtn").addEventListener("click", beginAuth);
-$("#settingsBtn").addEventListener("click", () => {
+$("#settingsBtn").addEventListener("click", () => $("#settingsSheet").classList.add("active"));
+$("#settingsCancel").addEventListener("click", () => $("#settingsSheet").classList.remove("active"));
+$("#rebuildIndexBtn").addEventListener("click", () => {
+  $("#settingsSheet").classList.remove("active");
+  if (confirm("Clear and re-scan all faces? Photos already downloaded won't be re-downloaded, just re-matched. This can take a while on a large library.")) {
+    rebuildFaceIndex();
+  }
+});
+$("#signOutBtn").addEventListener("click", () => {
+  $("#settingsSheet").classList.remove("active");
   if (confirm("Sign out of Dropbox on this phone? Your photo index stays cached until you clear it.")) {
     localStorage.removeItem("fs_access_token");
     localStorage.removeItem("fs_refresh_token");
